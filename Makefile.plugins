@@ -8,6 +8,9 @@ builtin_sources += plugins/autopair.c
 builtin_modules += policy
 builtin_sources += plugins/policy.c
 
+builtin_modules += switch2
+builtin_sources += plugins/switch2.c
+
 builtin_sources += profiles/audio/media.h profiles/audio/media.c \
 			profiles/audio/transport.h profiles/audio/transport.c \
 			profiles/audio/player.h profiles/audio/player.c
