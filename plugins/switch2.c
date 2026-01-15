@@ -229,6 +229,11 @@ static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gp
 
 					send_cmd(data, hdr->command, hdr->subcommand, payload, payload_len);
 				}
+			} else {
+				if (data->client && data->handle_out && ev.u.output.size > 1) {
+					bt_gatt_client_write_without_response(data->client, 0x0012,
+														  false, &ev.u.output.data[1], ev.u.output.size - 1);
+				}
 			}
 		}
 		break;
@@ -445,8 +450,6 @@ static void hid_notify_handler(uint16_t value_handle, const uint8_t *value, uint
 	struct switch2_data *data = user_data;
 	uint8_t buffer[65];
 	uint8_t report_id = 0x09; // Pro Controller 2
-
-	info("Switch2: IN 0x%02x (handle: %d, size: %d) -> Prepending ID 0x%02x", value[0], value_handle, report_id);
 
 	if (data->uhid_fd > 0) {
 		struct uhid_event ev;
