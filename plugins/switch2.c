@@ -479,12 +479,6 @@ static void setup_gatt(struct switch2_data *data) {
 
 	data->notify_id_cmd = bt_gatt_client_register_notify(data->client, 0x001A, notify_registered_cb, resp_notify_handler, data, NULL);
 	data->notify_id_hid = bt_gatt_client_register_notify(data->client, 0x000E, NULL, hid_notify_handler, data, NULL);
-
-	uint8_t init_cmd[2] = {0x01, 0x00};
-	/* Sent by Switch 2 console as the first command during init sequence */
-	bt_gatt_client_write_value(data->client, 0x0005, init_cmd, 2, NULL, NULL, NULL);
-	/* Enable notifications for command responses on handle 0x001E */
-	bt_gatt_client_write_value(data->client, 0x001B, init_cmd, 2, NULL, NULL, NULL);
 }
 
 static void gatt_ready_cb(bool success, uint8_t att_ecode, void *user_data) {
