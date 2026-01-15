@@ -355,7 +355,6 @@ static void enable_hid_reports(struct switch2_data *data) {
 static void forward_command_resp(struct switch2_data *data, const uint8_t *value, uint16_t length)
 {
 	uint8_t buffer[65];
-	uint8_t report_id = 0x09; // Pro Controller 2
 
 	if (data->uhid_fd > 0) {
 		struct uhid_event ev;
