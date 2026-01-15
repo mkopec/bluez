@@ -96,7 +96,160 @@ struct switch2_data {
 	uint8_t A1[16];   /* Host Public Key */
 	uint8_t A2[16];   /* Host Challenge */
 	uint8_t LTK[16];  /* Derived Long Term Key */
+
+	/* uHID */
+	int uhid_fd;
+	GIOChannel *uhid_io;
+	unsigned int uhid_watch_id;
 };
+
+static const uint8_t rdesc[] = {
+	0x05, 0x01,        // Usage Page (Generic Desktop Ctrls)
+	0x09, 0x05,        // Usage (Game Pad)
+	0xA1, 0x01,        // Collection (Application)
+	0x85, 0x05,        //   Report ID (5)
+	0x05, 0xFF,        //   Usage Page (Reserved 0xFF)
+	0x09, 0x01,        //   Usage (0x01)
+	0x15, 0x00,        //   Logical Minimum (0)
+	0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+	0x95, 0x3F,        //   Report Count (63)
+	0x75, 0x08,        //   Report Size (8)
+	0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0x85, 0x09,        //   Report ID (9)
+	0x09, 0x01,        //   Usage (0x01)
+	0x95, 0x02,        //   Report Count (2)
+	0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0x05, 0x09,        //   Usage Page (Button)
+	0x19, 0x01,        //   Usage Minimum (0x01)
+	0x29, 0x15,        //   Usage Maximum (0x15)
+	0x25, 0x01,        //   Logical Maximum (1)
+	0x95, 0x15,        //   Report Count (21)
+	0x75, 0x01,        //   Report Size (1)
+	0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0x95, 0x01,        //   Report Count (1)
+	0x75, 0x03,        //   Report Size (3)
+	0x81, 0x03,        //   Input (Const,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0x05, 0x01,        //   Usage Page (Generic Desktop Ctrls)
+	0x09, 0x01,        //   Usage (Pointer)
+	0xA1, 0x00,        //   Collection (Physical)
+	0x09, 0x30,        //     Usage (X)
+	0x09, 0x31,        //     Usage (Y)
+	0x09, 0x33,        //     Usage (Rx)
+	0x09, 0x35,        //     Usage (Rz)
+	0x26, 0xFF, 0x0F,  //     Logical Maximum (4095)
+	0x95, 0x04,        //     Report Count (4)
+	0x75, 0x0C,        //     Report Size (12)
+	0x81, 0x02,        //     Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0xC0,              //   End Collection
+	0x05, 0xFF,        //   Usage Page (Reserved 0xFF)
+	0x09, 0x02,        //   Usage (0x02)
+	0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+	0x95, 0x34,        //   Report Count (52)
+	0x75, 0x08,        //   Report Size (8)
+	0x81, 0x02,        //   Input (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position)
+	0x85, 0x02,        //   Report ID (2)
+	0x09, 0x01,        //   Usage (0x01)
+	0x95, 0x3F,        //   Report Count (63)
+	0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
+	0xC0,              // End Collection
+};
+
+static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gpointer user_data) {
+	struct switch2_data *data = user_data;
+	struct uhid_event ev;
+	ssize_t ret;
+
+	if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))
+		return FALSE;
+
+	ret = read(data->uhid_fd, &ev, sizeof(ev));
+	if (ret < (ssize_t)sizeof(ev.type))
+		return TRUE;
+
+	switch (ev.type) {
+	case UHID_START:
+	case UHID_OPEN:
+		// Kernel driver attached/opened
+		break;
+
+	case UHID_OUTPUT:
+		// TODO: Forward payload to the controller
+		break;
+
+	default:
+		break;
+	}
+
+	return TRUE;
+}
+
+static int create_uhid_device(struct switch2_data *data) {
+	struct uhid_event ev;
+	const bdaddr_t *src, *dst;
+	char src_str[18], dst_str[18];
+
+	if (data->uhid_fd > 0) return 0;
+
+	data->uhid_fd = open("/dev/uhid", O_RDWR | O_CLOEXEC);
+	if (data->uhid_fd < 0) return -errno;
+
+	memset(&ev, 0, sizeof(ev));
+	ev.type = UHID_CREATE2;
+	strncpy((char *)ev.u.create2.name, "Nintendo Switch 2 Pro Controller", sizeof(ev.u.create2.name) - 1);
+	ev.u.create2.vendor = 0x057e;
+	ev.u.create2.product = 0x2069;
+	ev.u.create2.version = 0x0001;
+	ev.u.create2.bus = BUS_BLUETOOTH;
+
+	ev.u.create2.rd_size = sizeof(rdesc);
+	memcpy(ev.u.create2.rd_data, rdesc, sizeof(rdesc));
+
+	src = btd_adapter_get_address(device_get_adapter(data->device));
+	dst = device_get_address(data->device);
+	ba2str(src, src_str);
+	ba2str(dst, dst_str);
+	strncpy((char *)ev.u.create2.phys, src_str, sizeof(ev.u.create2.phys) - 1);
+	strncpy((char *)ev.u.create2.uniq, dst_str, sizeof(ev.u.create2.uniq) - 1);
+
+	if (write(data->uhid_fd, &ev, sizeof(ev)) < 0) {
+		int err = -errno;
+		close(data->uhid_fd);
+		data->uhid_fd = -1;
+		return err;
+    }
+
+	data->uhid_io = g_io_channel_unix_new(data->uhid_fd);
+	g_io_channel_set_encoding(data->uhid_io, NULL, NULL);
+	data->uhid_watch_id = g_io_add_watch(data->uhid_io,
+										G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
+										uhid_read_handler, data);
+
+	info("Switch2: Created uHID device");
+
+	return 0;
+}
+
+static void cleanup_uhid(struct switch2_data *data) {
+	if (data->uhid_watch_id) {
+		g_source_remove(data->uhid_watch_id);
+		data->uhid_watch_id = 0;
+	}
+
+	if (data->uhid_io) {
+		g_io_channel_unref(data->uhid_io);
+		data->uhid_io = NULL;
+	}
+
+	if (data->uhid_fd > 0) {
+		struct uhid_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.type = UHID_DESTROY;
+		write(data->uhid_fd, &ev, sizeof(ev));
+
+		close(data->uhid_fd);
+		data->uhid_fd = -1;
+	}
+}
 
 static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcommand, const uint8_t *payload, size_t payload_len) {
 	uint8_t buf[256];
@@ -133,7 +286,6 @@ static void pairing_exchange_addr(struct switch2_data *data) {
 	memcpy(&payload[2], addr, 6);
 	memcpy(&payload[8], addr, 6);
 
-	info("Switch2: Pairing - Exchange Addresses");
 	send_cmd(data, NS2_CMD_BT_PAIR, 0x01, payload, sizeof(payload));
 }
 
@@ -149,7 +301,6 @@ static void pairing_exchange_ltk_components(struct switch2_data *data) {
 
 	memcpy(&payload[1], data->A1, 16);
 
-	info("Switch2: Pairing - Exchange LTK Components");
 	send_cmd(data, NS2_CMD_BT_PAIR, 0x04, payload, sizeof(payload));
 }
 
@@ -165,14 +316,11 @@ static void pairing_send_challenge(struct switch2_data *data) {
 
 	memcpy(&payload[1], data->A2, 16);
 
-	info("Switch2: Pairing - Send Challenge");
 	send_cmd(data, NS2_CMD_BT_PAIR, 0x02, payload, sizeof(payload));
 }
 
 static void pairing_finalize(struct switch2_data *data) {
 	uint8_t payload = 0;
-
-	info("Switch2: Pairing - Finalize");
 	send_cmd(data, NS2_CMD_BT_PAIR, 0x03, &payload, sizeof(payload));
 }
 
@@ -191,39 +339,34 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 	switch (data->state) {
 	case NS2_INIT_CMD_07:
 		if (hdr->command == NS2_CMD_INIT_07) {
-			info("Switch2: CMD 0x07 ACK");
 			data->state = NS2_INIT_CMD_16;
 			send_cmd(data, NS2_CMD_INIT_16, 0x01, NULL, 0);
 		}
 		break;
 	case NS2_INIT_CMD_16:
 		if (hdr->command == NS2_CMD_INIT_16) {
-			info("Switch2: CMD 0x16 ACK");
 			data->state = NS2_INIT_BT_ADDR_EXCHANGE;
 			pairing_exchange_addr(data);
 		}
 		break;
 	case NS2_INIT_BT_ADDR_EXCHANGE:
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x01) {
-			info("Switch2: BT Address Exchange ACK");
 			data->state = NS2_INIT_BT_LTK_COMPONENT_EXCHANGE;
 			pairing_exchange_ltk_components(data);
 		}
 		break;
 	case NS2_INIT_BT_LTK_COMPONENT_EXCHANGE:
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x04) {
-			info("Switch2: BT LTK Exchange ACK");
 			data->state = NS2_INIT_BT_FINALIZE;
 
-			for (int i = 0; i < 16; ++i) {
+			for (int i = 0; i < 16; ++i)
 				data->LTK[i] = data->A1[i] ^ payload[i + 1];
-			}
+
 			pairing_send_challenge(data);
 		}
 		break;
 	case NS2_INIT_BT_FINALIZE:
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x02) {
-			info("Switch2: BT LTK Challenge ACK");
 			data->state = NS2_INIT_ENABLE_HID;
 			/* TODO: Verify B2 response */
 			pairing_finalize(data);
@@ -231,17 +374,30 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 		break;
 	case NS2_INIT_ENABLE_HID:
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x03) {
-			info("Switch2: BT Init Done ACK");
 			data->state = NS2_INIT_DONE;
 			enable_hid_reports(data);
+			create_uhid_device(data);
 		}
 		break;
 	}
 }
 
 static void hid_notify_handler(uint16_t value_handle, const uint8_t *value, uint16_t length, void *user_data) {
-	/* Do the actual HID handling here */
-	info("Switch2: HID packet received");
+	struct switch2_data *data = user_data;
+
+	info("Switch2: IN 0x%02x (size: %d)", value[0], length);
+
+	if (data->uhid_fd > 0) {
+		struct uhid_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.type = UHID_INPUT2;
+		ev.u.input2.size = length;
+
+		if (length <= sizeof(ev.u.input2.data)) {
+			memcpy(ev.u.input2.data, value, length);
+			write(data->uhid_fd, &ev, sizeof(ev));
+		}
+	}
 }
 
 static void notify_registered_cb(uint16_t att_ecode, void *user_data) {
@@ -331,7 +487,11 @@ static int switch2_connect(struct btd_service *service) {
 }
 
 static int switch2_disconnect(struct btd_service *service) {
+	struct switch2_data *data = btd_service_get_user_data(service);
+
 	btd_service_disconnecting_complete(service, 0);
+	cleanup_uhid(data);
+
 	return 0;
 }
 
