@@ -38,6 +38,9 @@
 #define NS2_FLAG_OK	BIT(0)
 #define NS2_FLAG_NACK	BIT(2)
 
+/* Custom-defined Report ID for tunneling command data */
+#define NS2_REPORT_CMD_TUNNEL 0x40
+
 enum switch2_cmd {
 	NS2_CMD_FLASH = 0x02,
 	NS2_CMD_INIT = 0x03,
@@ -154,6 +157,30 @@ static const uint8_t rdesc[] = {
 	0xC0,              // End Collection
 };
 
+static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcommand, const uint8_t *payload, size_t payload_len) {
+	uint8_t buf[256];
+	memset(buf, 0, sizeof(buf));
+
+	struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)buf;
+	hdr->command = command;
+	hdr->direction = NS2_DIR_OUT | NS2_FLAG_OK;
+	hdr->transport = NS2_TRANS_BT;
+	hdr->subcommand = subcommand;
+	hdr->unk1 = 0x00;
+	hdr->length = (uint8_t)payload_len;
+	hdr->unk2 = 0x0000;
+
+	if (payload && payload_len > 0)
+		memcpy(buf + sizeof(struct switch2_cmd_header), payload, payload_len);
+
+	info("Switch2: OUT 0x%02X [Sub %02X] (Total %zu)", command, subcommand,
+			payload_len + sizeof(struct switch2_cmd_header));
+
+	if (data->handle_out && data->client)
+		bt_gatt_client_write_without_response(data->client, data->handle_out,
+				false, buf, payload_len + sizeof(struct switch2_cmd_header));
+}
+
 static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gpointer user_data) {
 	struct switch2_data *data = user_data;
 	struct uhid_event ev;
@@ -170,10 +197,29 @@ static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gp
 	case UHID_START:
 	case UHID_OPEN:
 		// Kernel driver attached/opened
+		info("Kernel driver attached");
 		break;
 
 	case UHID_OUTPUT:
-		// TODO: Forward payload to the controller
+		if (ev.u.output.rtype == UHID_OUTPUT_REPORT) {
+			uint8_t report_id = ev.u.output.data[0];
+
+			/* Command 0x40 - Encapsulated configuration data */
+			if (report_id == NS2_REPORT_CMD_TUNNEL) {
+				struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)&ev.u.output.data[1];
+
+				size_t header_size = sizeof(struct switch2_cmd_header);
+				size_t overhead = 1 + header_size;
+
+				if (ev.u.output.size >= overhead) {
+					uint8_t *payload = &ev.u.output.data[overhead];
+					size_t payload_len = ev.u.output.size - overhead;
+
+					/* Reconstruct the packet using the helper */
+					send_cmd(data, hdr->command, hdr->subcommand, payload, payload_len);
+				}
+			}
+		}
 		break;
 
 	default:
@@ -251,30 +297,6 @@ static void cleanup_uhid(struct switch2_data *data) {
 	}
 }
 
-static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcommand, const uint8_t *payload, size_t payload_len) {
-	uint8_t buf[256];
-	memset(buf, 0, sizeof(buf));
-
-	struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)buf;
-	hdr->command = command;
-	hdr->direction = NS2_DIR_OUT | NS2_FLAG_OK;
-	hdr->transport = NS2_TRANS_BT;
-	hdr->subcommand = subcommand;
-	hdr->unk1 = 0x00;
-	hdr->length = (uint8_t)payload_len;
-	hdr->unk2 = 0x0000;
-
-	if (payload && payload_len > 0)
-		memcpy(buf + sizeof(struct switch2_cmd_header), payload, payload_len);
-
-	info("Switch2: OUT 0x%02X [Sub %02X] (Total %zu)", command, subcommand,
-			payload_len + sizeof(struct switch2_cmd_header));
-
-	if (data->handle_out && data->client)
-		bt_gatt_client_write_without_response(data->client, data->handle_out,
-				false, buf, payload_len + sizeof(struct switch2_cmd_header));
-}
-
 static void pairing_exchange_addr(struct switch2_data *data) {
 	struct btd_adapter *adapter = device_get_adapter(data->device);
 	const bdaddr_t *addr = btd_adapter_get_address(adapter);
@@ -329,6 +351,25 @@ static void enable_hid_reports(struct switch2_data *data) {
 	bt_gatt_client_write_value(data->client, 0x000f, cmd, 2, NULL, NULL, NULL);
 }
 
+/* Forward responses on the configuration channel to uHID */
+static void forward_command_resp(struct switch2_data *data, const uint8_t *value, uint16_t length)
+{
+	uint8_t buffer[65];
+	uint8_t report_id = 0x09; // Pro Controller 2
+
+	if (data->uhid_fd > 0) {
+		struct uhid_event ev;
+		memset(&ev, 0, sizeof(ev));
+		ev.type = UHID_INPUT2;
+
+		ev.u.input2.size = length + 1;
+		ev.u.input2.data[0] = NS2_REPORT_CMD_TUNNEL;
+		memcpy(&ev.u.input2.data[1], value, length);
+
+		write(data->uhid_fd, &ev, sizeof(ev));
+	}
+}
+
 static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uint16_t length, void *user_data) {
 	struct switch2_data *data = user_data;
 	struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)value;
@@ -369,6 +410,7 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x02) {
 			data->state = NS2_INIT_ENABLE_HID;
 			/* TODO: Verify B2 response */
+			/* TODO: Persist LTK and skip pairing on reconnect */
 			pairing_finalize(data);
 		}
 		break;
@@ -379,25 +421,39 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 			create_uhid_device(data);
 		}
 		break;
+	case NS2_INIT_DONE:
+		/* Forward command responses to uHID */
+		info("Switch2: Forwarding command response to uHID");
+		forward_command_resp(data, value, length);
+		break;
+	default:
+		break;
 	}
 }
 
 static void hid_notify_handler(uint16_t value_handle, const uint8_t *value, uint16_t length, void *user_data) {
 	struct switch2_data *data = user_data;
+	uint8_t buffer[65];
+	uint8_t report_id = 0x09; // Pro Controller 2
 
-	info("Switch2: IN 0x%02x (size: %d)", value[0], length);
+	info("Switch2: IN 0x%02x (handle: %d, size: %d) -> Prepending ID 0x%02x", value[0], value_handle, report_id);
 
 	if (data->uhid_fd > 0) {
 		struct uhid_event ev;
 		memset(&ev, 0, sizeof(ev));
 		ev.type = UHID_INPUT2;
-		ev.u.input2.size = length;
 
-		if (length <= sizeof(ev.u.input2.data)) {
-			memcpy(ev.u.input2.data, value, length);
+		if (length + 1 <= sizeof(ev.u.input2.data)) {
+			ev.u.input2.size = length + 1;
+
+			ev.u.input2.data[0] = report_id;
+			memcpy(&ev.u.input2.data[1], value, length);
+
 			write(data->uhid_fd, &ev, sizeof(ev));
+		} else {
+			error("Switch2: Report too large for UHID buffer");
 		}
-	}
+    }
 }
 
 static void notify_registered_cb(uint16_t att_ecode, void *user_data) {
