@@ -155,6 +155,18 @@ static const uint8_t rdesc[] = {
 	0x95, 0x3F,        //   Report Count (63)
 	0x91, 0x02,        //   Output (Data,Var,Abs,No Wrap,Linear,Preferred State,No Null Position,Non-volatile)
 	0xC0,              // End Collection
+	0x06, 0x00, 0xFF,  // Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01,        // Usage (Vendor Usage 1)
+    0xA1, 0x01,        // Collection (Application)
+    0x85, 0x40,        //   Report ID (0x40 - NS2_REPORT_CMD_TUNNEL)
+    0x09, 0x02,        //   Usage (Vendor Usage 2)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
+    0x95, 0x40,        //   Report Count (64 bytes)
+    0x75, 0x08,        //   Report Size (8 bits)
+    0x81, 0x02,        //   Input (Data,Var,Abs)
+    0x91, 0x02,        //   Output (Data,Var,Abs)
+    0xC0,              // End Collection
 };
 
 static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcommand, const uint8_t *payload, size_t payload_len) {
@@ -215,7 +227,6 @@ static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gp
 					uint8_t *payload = &ev.u.output.data[overhead];
 					size_t payload_len = ev.u.output.size - overhead;
 
-					/* Reconstruct the packet using the helper */
 					send_cmd(data, hdr->command, hdr->subcommand, payload, payload_len);
 				}
 			}
