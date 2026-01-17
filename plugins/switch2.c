@@ -661,6 +661,8 @@ static void pairing_send_challenge(struct switch2_data *data) {
 static void pairing_finalize(struct switch2_data *data) {
 	uint8_t payload = 0;
 	send_cmd(data, NS2_CMD_BT_PAIR, 0x03, &payload, sizeof(payload));
+	btd_device_set_trusted(data->device, true);
+	btd_device_set_temporary(data->device, false);
 }
 
 static void enable_hid_reports(struct switch2_data *data) {
