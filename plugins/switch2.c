@@ -671,6 +671,11 @@ static void play_vibration_sample(struct switch2_data *data) {
 	send_cmd(data, NS2_CMD_RUMBLE, 0x02, cmd, sizeof(cmd));
 }
 
+static void set_report_rate(struct switch2_data *data) {
+	uint8_t cmd[2] = { 0x85, 0x00 };
+	bt_gatt_client_write_value(data->client, 0x0010, cmd, 2, NULL, NULL, NULL);
+}
+
 static void enable_hid_reports(struct switch2_data *data) {
 	uint8_t cmd[2] = {0x01, 0x00};
 	bt_gatt_client_write_value(data->client, 0x000f, cmd, 2, NULL, NULL, NULL);
@@ -708,8 +713,9 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 			if (memcmp(data->LTK, &payload[8], 16) == 0) {
 				info("Switch2: LTK Match! Skipping pairing.");
 				data->state = NS2_INIT_DONE;
-				enable_hid_reports(data);
 				play_vibration_sample(data);
+				set_report_rate(data);
+				enable_hid_reports(data);
 				create_uhid_device(data);
 			} else {
 				info("Switch2: LTK Mismatch or New Device. Starting pairing...");
@@ -745,9 +751,10 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 	case NS2_INIT_ENABLE_HID:
 		if (hdr->command == NS2_CMD_BT_PAIR && hdr->subcommand == 0x03) {
 			data->state = NS2_INIT_DONE;
+			play_vibration_sample(data);
+			set_report_rate(data);
 			enable_hid_reports(data);
 			create_uhid_device(data);
-			play_vibration_sample(data);
 		}
 		break;
 	case NS2_INIT_DONE:
@@ -846,6 +853,8 @@ static int switch2_connect(struct btd_service *service) {
 		data->ready_id = bt_gatt_client_ready_register(data->client, gatt_ready_cb, data, NULL);
 
 	load_ltk(data);
+
+	btd_device_set_conn_param(data->device, 0x0006, 0x0006, 0, 10);
 
 	btd_service_connecting_complete(service, 0);
 	return 0;
