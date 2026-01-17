@@ -854,6 +854,7 @@ static int switch2_connect(struct btd_service *service) {
 
 	load_ltk(data);
 
+	/* Set min/max interval to 7.5ms, latency to 0, timeout to 100ms */
 	btd_device_set_conn_param(data->device, 0x0006, 0x0006, 0, 10);
 
 	btd_service_connecting_complete(service, 0);
