@@ -46,6 +46,7 @@ enum switch2_cmd {
 	NS2_CMD_FLASH = 0x02,
 	NS2_CMD_INIT = 0x03,
 	NS2_CMD_INIT_07 = 0x07, /* Sent during init sequence */
+	NS2_CMD_RUMBLE = 0x0a,
 	NS2_CMD_BATTERY = 0x0b,
 	NS2_CMD_FW_INFO = 0x10,
 	NS2_CMD_BT_PAIR = 0x15,
@@ -70,10 +71,10 @@ enum switch2_ctlr_type {
 };
 
 char * switch2_ctlr_type_name[] = {
-	[NS2_CTLR_TYPE_JCL] = "Joy-Con (L)",
-	[NS2_CTLR_TYPE_JCR] = "Joy-Con (R)",
-	[NS2_CTLR_TYPE_PRO] = "Pro Controller",
-	[NS2_CTLR_TYPE_GC] = "GameCube Controller",
+	[NS2_CTLR_TYPE_JCL] = "Joy-Con 2 (L)",
+	[NS2_CTLR_TYPE_JCR] = "Joy-Con 2 (R)",
+	[NS2_CTLR_TYPE_PRO] = "Nintendo Switch 2 Pro Controller",
+	[NS2_CTLR_TYPE_GC] = "Nintendo GameCube Controller",
 };
 
 struct switch2_cmd_header {
@@ -665,6 +666,11 @@ static void pairing_finalize(struct switch2_data *data) {
 	btd_device_set_temporary(data->device, false);
 }
 
+static void play_vibration_sample(struct switch2_data *data) {
+	uint8_t cmd[] = { 0x03, 0x00, 0x00, 0x00};
+	send_cmd(data, NS2_CMD_RUMBLE, 0x02, cmd, sizeof(cmd));
+}
+
 static void enable_hid_reports(struct switch2_data *data) {
 	uint8_t cmd[2] = {0x01, 0x00};
 	bt_gatt_client_write_value(data->client, 0x000f, cmd, 2, NULL, NULL, NULL);
@@ -696,12 +702,14 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 			data->state = NS2_INIT_BT_CHECK_LTK;
 			send_read_spi(data, SPI_ADDR_LTK, 16);
 		}
+		break;
 	case NS2_INIT_BT_CHECK_LTK:
 		if (hdr->command == NS2_CMD_FLASH) {
 			if (memcmp(data->LTK, &payload[8], 16) == 0) {
 				info("Switch2: LTK Match! Skipping pairing.");
 				data->state = NS2_INIT_DONE;
 				enable_hid_reports(data);
+				play_vibration_sample(data);
 				create_uhid_device(data);
 			} else {
 				info("Switch2: LTK Mismatch or New Device. Starting pairing...");
@@ -739,6 +747,7 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 			data->state = NS2_INIT_DONE;
 			enable_hid_reports(data);
 			create_uhid_device(data);
+			play_vibration_sample(data);
 		}
 		break;
 	case NS2_INIT_DONE:
