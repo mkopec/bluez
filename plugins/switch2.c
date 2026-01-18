@@ -27,6 +27,7 @@
 #include "src/profile.h"
 #include "src/log.h"
 #include "src/service.h"
+#include "src/shared/uhid.h"
 #include "src/shared/util.h"
 #include "src/shared/queue.h"
 #include "src/shared/att.h"
@@ -144,9 +145,7 @@ struct switch2_data {
 	uint8_t LTK[16];  /* Derived Long Term Key */
 
 	/* uHID */
-	int uhid_fd;
-	GIOChannel *uhid_io;
-	unsigned int uhid_watch_id;
+	struct bt_uhid *uhid;
 };
 
 static const uint8_t rdesc_pro[] = {
@@ -340,25 +339,6 @@ static const uint8_t rdesc_jcl[] = {
     0xC0,              // End Collection
 };
 
-static void write_uhid_padded(struct switch2_data *data, uint8_t report_id, const uint8_t *payload, uint16_t length)
-{
-    if (data->uhid_fd <= 0)
-        return;
-
-    struct uhid_event ev;
-    memset(&ev, 0, sizeof(ev));
-    ev.type = UHID_INPUT2;
-
-    ev.u.input2.size = 65;
-    ev.u.input2.data[0] = report_id;
-
-    size_t to_copy = (length > 64) ? 64 : length;
-    if (payload && to_copy > 0)
-        memcpy(&ev.u.input2.data[1], payload, to_copy);
-
-    write(data->uhid_fd, &ev, sizeof(ev));
-}
-
 static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcommand, const uint8_t *payload, size_t payload_len) {
 	uint8_t buf[256];
 	memset(buf, 0, sizeof(buf));
@@ -380,118 +360,87 @@ static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcomm
 				false, buf, payload_len + sizeof(struct switch2_cmd_header));
 }
 
-static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gpointer user_data) {
+static void uhid_event_cb(struct uhid_event *ev, void *user_data)
+{
 	struct switch2_data *data = user_data;
-	struct uhid_event ev;
-	ssize_t ret;
 
-	if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL))
-		return FALSE;
-
-	ret = read(data->uhid_fd, &ev, sizeof(ev));
-	if (ret < (ssize_t)sizeof(ev.type))
-		return TRUE;
-
-	switch (ev.type) {
+	switch (ev->type) {
 	case UHID_OUTPUT:
-		if (ev.u.output.rtype == UHID_OUTPUT_REPORT) {
-			uint8_t report_id = ev.u.output.data[0];
+		info("Switch2: uHID output payload");
+		if (ev->u.output.rtype != UHID_OUTPUT_REPORT)
+			break;
 
-			if (report_id == NS2_REPORT_CMD_TUNNEL) {
-				/* Configuration data - Encapsulated in HID reports with ID 0x40 */
-				struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)&ev.u.output.data[1];
+		uint8_t report_id = ev->u.output.data[0];
 
-				size_t header_size = sizeof(struct switch2_cmd_header);
-				size_t overhead = 1 + header_size;
+		if (report_id == NS2_REPORT_CMD_TUNNEL) {
+			/* Tunelled command / response */
+			struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)&ev->u.output.data[1];
 
-				if (ev.u.output.size >= overhead) {
-					uint8_t *payload = &ev.u.output.data[overhead];
-					size_t payload_len = ev.u.output.size - overhead;
+			size_t header_size = sizeof(struct switch2_cmd_header);
+			size_t overhead = 1 + header_size;
 
-					send_cmd(data, hdr->command, hdr->subcommand, payload, payload_len);
-				}
-			} else {
-				/* Rumble - Handle 0x0012 */
-				if (data->client && data->handle_out && ev.u.output.size > 1) {
-					bt_gatt_client_write_without_response(data->client, 0x0012,
-														  false, &ev.u.output.data[1], ev.u.output.size - 1);
-				}
+			if (ev->u.output.size >= overhead) {
+				uint8_t *payload = &ev->u.output.data[overhead];
+				size_t payload_len = ev->u.output.size - overhead;
+
+				send_cmd(data, hdr->command, hdr->subcommand, payload, payload_len);
+			}
+		} else {
+			/* Standard Rumble/Output - Handle 0x0012 */
+			if (data->client && data->handle_out) {
+				bt_gatt_client_write_without_response(data->client,
+					0x0012, false, &ev->u.output.data[1],
+					ev->u.output.size - 1);
 			}
 		}
 		break;
-
 	default:
 		break;
 	}
-
-	return TRUE;
 }
 
 static int create_uhid_device(struct switch2_data *data) {
-	struct uhid_event ev;
-	const bdaddr_t *src, *dst;
-	char src_str[18], dst_str[18];
+	struct btd_adapter *adapter = device_get_adapter(data->device);
+	bdaddr_t src, dst;
 
-	if (data->uhid_fd > 0) return 0;
+	if (data->uhid)
+		return 0;
 
-	data->uhid_fd = open("/dev/uhid", O_RDWR | O_CLOEXEC);
-	if (data->uhid_fd < 0) return -errno;
-
-	memset(&ev, 0, sizeof(ev));
-	ev.type = UHID_CREATE2;
-	strncpy((char *)ev.u.create2.name, data->name, sizeof(ev.u.create2.name) - 1);
-	ev.u.create2.vendor = 0x057e;
-	ev.u.create2.product = 0x2069;
-	ev.u.create2.version = 0x0001;
-	ev.u.create2.bus = BUS_BLUETOOTH;
-
-	ev.u.create2.rd_size = data->rdesc_size;
-	memcpy(ev.u.create2.rd_data, data->rdesc, data->rdesc_size);
-
-	src = btd_adapter_get_address(device_get_adapter(data->device));
-	dst = device_get_address(data->device);
-	ba2str(src, src_str);
-	ba2str(dst, dst_str);
-	strncpy((char *)ev.u.create2.phys, src_str, sizeof(ev.u.create2.phys) - 1);
-	strncpy((char *)ev.u.create2.uniq, dst_str, sizeof(ev.u.create2.uniq) - 1);
-
-	if (write(data->uhid_fd, &ev, sizeof(ev)) < 0) {
-		int err = -errno;
-		close(data->uhid_fd);
-		data->uhid_fd = -1;
-		return err;
+	data->uhid = bt_uhid_new_default();
+	if (!data->uhid) {
+		error("Switch2: Failed to open uHID default device");
+		return -EIO;
 	}
 
-	data->uhid_io = g_io_channel_unix_new(data->uhid_fd);
-	g_io_channel_set_encoding(data->uhid_io, NULL, NULL);
-	data->uhid_watch_id = g_io_add_watch(data->uhid_io,
-										G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
-										uhid_read_handler, data);
+	bt_uhid_register(data->uhid, UHID_OUTPUT, uhid_event_cb, data);
 
-	return 0;
+	bacpy(&src, btd_adapter_get_address(adapter));
+	bacpy(&dst, device_get_address(data->device));
+
+	return bt_uhid_create(data->uhid, data->name, &src, &dst,
+				0x057e, 0x2069, 0x0001, 0,
+				0, (void *)data->rdesc, data->rdesc_size);
 }
 
-static void cleanup_uhid(struct switch2_data *data) {
-	if (data->uhid_watch_id) {
-		g_source_remove(data->uhid_watch_id);
-		data->uhid_watch_id = 0;
-	}
+static void forward_to_uhid(struct switch2_data *data, uint8_t report_id,
+				const uint8_t *payload, size_t len)
+{
+	if (!data->uhid)
+		return;
 
-	if (data->uhid_io) {
-		g_io_channel_unref(data->uhid_io);
-		data->uhid_io = NULL;
-	}
-
-	if (data->uhid_fd > 0) {
-		struct uhid_event ev;
-		memset(&ev, 0, sizeof(ev));
-		ev.type = UHID_DESTROY;
-		write(data->uhid_fd, &ev, sizeof(ev));
-
-		close(data->uhid_fd);
-		data->uhid_fd = -1;
-	}
+	bt_uhid_input(data->uhid, report_id, payload, len);
 }
+
+static void cleanup_uhid(struct switch2_data *data)
+{
+	if (!data->uhid)
+		return;
+
+	bt_uhid_destroy(data->uhid, true);
+	bt_uhid_unref(data->uhid);
+	data->uhid = NULL;
+}
+
 
 static void save_ltk(struct switch2_data *data) {
 	GKeyFile *key_file = g_key_file_new();
@@ -548,14 +497,14 @@ static bool load_ltk(struct switch2_data *data) {
 }
 
 static void send_read_spi(struct switch2_data *data, uint32_t address, uint8_t length) {
-    uint8_t payload[8] = { length, 0x7e };
+	uint8_t payload[8] = { length, 0x7e };
 
-    payload[4] = (address & 0xFF);
-    payload[5] = ((address >> 8) & 0xFF);
-    payload[6] = ((address >> 16) & 0xFF);
-    payload[7] = 0x00;
+	payload[4] = (address & 0xFF);
+	payload[5] = ((address >> 8) & 0xFF);
+	payload[6] = ((address >> 16) & 0xFF);
+	payload[7] = 0x00;
 
-    send_cmd(data, NS2_CMD_FLASH, 0x04, payload, 8);
+	send_cmd(data, NS2_CMD_FLASH, 0x04, payload, 8);
 }
 
 static void parse_fw_info(struct switch2_data *data, const uint8_t *raw) {
@@ -741,7 +690,7 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 		break;
 	case NS2_INIT_DONE:
 		/* BT init done, forward further command respnses to uHID */
-		write_uhid_padded(data, NS2_REPORT_CMD_TUNNEL, value, length);
+		forward_to_uhid(data, NS2_REPORT_CMD_TUNNEL, value, length);
 		break;
 	default:
 		break;
@@ -751,8 +700,7 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 static void hid_notify_handler(uint16_t value_handle, const uint8_t *value, uint16_t length, void *user_data) {
 	struct switch2_data *data = user_data;
 
-	if (data->uhid_fd > 0)
-		write_uhid_padded(data, data->report_id, value, length);
+	forward_to_uhid(data, data->report_id, value, length);
 }
 
 static void notify_registered_cb(uint16_t att_ecode, void *user_data) {
@@ -769,8 +717,8 @@ static void notify_registered_cb(uint16_t att_ecode, void *user_data) {
 	/* Enable notifications for command responses on handle 0x001E */
 	bt_gatt_client_write_value(data->client, 0x001B, init_cmd, 2, NULL, NULL, NULL);
 
-    data->state = NS2_INIT_CMD_07;
-    send_cmd(data, NS2_CMD_INIT_07, 0x01, NULL, 0);
+	data->state = NS2_INIT_CMD_07;
+	send_cmd(data, NS2_CMD_INIT_07, 0x01, NULL, 0);
 }
 
 static void setup_gatt(struct switch2_data *data) {
