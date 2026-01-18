@@ -27,14 +27,13 @@
 #include "src/profile.h"
 #include "src/log.h"
 #include "src/service.h"
+#include "src/textfile.h"
 #include "src/shared/uhid.h"
 #include "src/shared/util.h"
 #include "src/shared/queue.h"
 #include "src/shared/att.h"
 #include "src/shared/gatt-db.h"
 #include "src/shared/gatt-client.h"
-
-#define STORAGE_PATH "/var/lib/bluetooth/switch2_keys.ini"
 
 #define NS2_BLE_SERVICE_UUID "ab7de9be-89fe-49ad-828f-118f09df7fd0"
 
@@ -366,7 +365,6 @@ static void uhid_event_cb(struct uhid_event *ev, void *user_data)
 
 	switch (ev->type) {
 	case UHID_OUTPUT:
-		info("Switch2: uHID output payload");
 		if (ev->u.output.rtype != UHID_OUTPUT_REPORT)
 			break;
 
@@ -441,60 +439,86 @@ static void cleanup_uhid(struct switch2_data *data)
 	data->uhid = NULL;
 }
 
-
-static void save_ltk(struct switch2_data *data) {
-	GKeyFile *key_file = g_key_file_new();
-	char addr[18];
-
-	// Load existing file to preserve other devices
-	g_key_file_load_from_file(key_file, STORAGE_PATH, G_KEY_FILE_NONE, NULL);
-
-	ba2str(device_get_address(data->device), addr);
-
-	// Convert LTK bytes to hex string
-	char ltk_str[33];
-	for(int i=0; i<16; i++) sprintf(&ltk_str[i*2], "%02X", data->LTK[i]);
-	ltk_str[32] = '\0';
-
-	g_key_file_set_string(key_file, "ltk", addr, ltk_str);
-
-	// Save to disk
+static void save_ltk(struct switch2_data *data)
+{
+	struct btd_adapter *adapter = device_get_adapter(data->device);
+	const bdaddr_t *adapter_bdaddr = btd_adapter_get_address(adapter);
+	const bdaddr_t *device_bdaddr = device_get_address(data->device);
+	char adapter_addr[18], device_addr[18];
+	char filename[PATH_MAX];
+	GKeyFile *key_file;
+	char key_str[33];
 	gsize length = 0;
-	gchar *content = g_key_file_to_data(key_file, &length, NULL);
-	g_file_set_contents(STORAGE_PATH, content, length, NULL);
+	gchar *data_str;
+	int i;
 
-	g_free(content);
+	ba2str(adapter_bdaddr, adapter_addr);
+	ba2str(device_bdaddr, device_addr);
+
+	create_filename(filename, PATH_MAX, "/%s/%s/info", adapter_addr, device_addr);
+
+	key_file = g_key_file_new();
+	g_key_file_load_from_file(key_file, filename, G_KEY_FILE_KEEP_COMMENTS, NULL);
+
+	for (i = 0; i < 16; i++)
+		sprintf(key_str + (i * 2), "%02X", data->LTK[i]);
+
+
+	g_key_file_set_string(key_file, "LongTermKey", "Key", key_str);
+
+	data_str = g_key_file_to_data(key_file, &length, NULL);
+	if (!g_file_set_contents(filename, data_str, length, NULL))
+		error("Switch2: Unable to write LTK to %s", filename);
+	else
+		info("Switch2: Saved LTK to %s", filename);
+
+	g_free(data_str);
 	g_key_file_free(key_file);
 }
 
-static bool load_ltk(struct switch2_data *data) {
-	GKeyFile *key_file = g_key_file_new();
-	char addr[18];
-	GError *error = NULL;
+static bool load_ltk(struct switch2_data *data)
+{
+	struct btd_adapter *adapter = device_get_adapter(data->device);
+	const bdaddr_t *adapter_bdaddr = btd_adapter_get_address(adapter);
+	const bdaddr_t *device_bdaddr = device_get_address(data->device);
+	char adapter_addr[18], device_addr[18];
+	char filename[PATH_MAX];
+	GKeyFile *key_file;
+	gchar *key_str;
+	int i;
 	bool success = false;
 
-	if (!g_key_file_load_from_file(key_file, STORAGE_PATH, G_KEY_FILE_NONE, NULL)) {
+	ba2str(adapter_bdaddr, adapter_addr);
+	ba2str(device_bdaddr, device_addr);
+
+	create_filename(filename, PATH_MAX, "/%s/%s/info", adapter_addr, device_addr);
+
+	key_file = g_key_file_new();
+	if (!g_key_file_load_from_file(key_file, filename, G_KEY_FILE_NONE, NULL)) {
+		warn("Switch2: Failed to load info file from %s", filename);
 		g_key_file_free(key_file);
 		return false;
 	}
-
-	ba2str(device_get_address(data->device), addr);
-	gchar *ltk_str = g_key_file_get_string(key_file, "ltk", addr, &error);
-
-	if (ltk_str && strlen(ltk_str) == 32) {
-		// Convert hex string back to bytes
-		for(int i=0; i<16; i++) {
-			unsigned int byte;
-			sscanf(&ltk_str[i*2], "%02X", &byte);
+	key_str = g_key_file_get_string(key_file, "LongTermKey", "Key", NULL);
+	if (key_str && strlen(key_str) == 32) {
+		for (i = 0; i < 16; i++) {
+			uint8_t byte;
+			sscanf(key_str + (i * 2), "%02X", &byte);
 			data->LTK[i] = (uint8_t)byte;
 		}
+		info("Switch2: Successfully loaded LTK from file", strlen(key_str));
 		success = true;
+	} else {
+		warn("Switch2: No valid LTK found in info file");
 	}
 
-	if (ltk_str) g_free(ltk_str);
+	if (key_str)
+		g_free(key_str);
 	g_key_file_free(key_file);
+
 	return success;
 }
+
 
 static void send_read_spi(struct switch2_data *data, uint32_t address, uint8_t length) {
 	uint8_t payload[8] = { length, 0x7e };
@@ -518,7 +542,6 @@ static void parse_fw_info(struct switch2_data *data, const uint8_t *raw) {
 		data->name = switch2_ctlr_type_name[fw_info->ctlr_type];
 		info("Switch2: Type: %s", data->name);
 	}
-
 
 	if (fw_info->ctlr_type == NS2_CTLR_TYPE_PRO)
 		info("Switch2: DSP: %02d.%02d.%02d.%02d", fw_info->dsp_major, fw_info->dsp_minor, fw_info->dsp_patch, fw_info->dsp_type);
