@@ -85,7 +85,7 @@ struct switch2_cmd_header {
 	uint8_t unk1;
 	uint8_t length;
 	uint16_t unk2;
-};
+}; __attribute__((packed))
 
 struct switch2_version_info {
 	uint8_t major;
@@ -93,11 +93,11 @@ struct switch2_version_info {
 	uint8_t patch;
 	uint8_t ctlr_type;
 	uint32_t unk;
-	int8_t dsp_major;
-	int8_t dsp_minor;
-	int8_t dsp_patch;
-	int8_t dsp_type;
-};
+	uint8_t dsp_major;
+	uint8_t dsp_minor;
+	uint8_t dsp_patch;
+	uint8_t dsp_type;
+}; __attribute__((packed))
 
 enum switch2_init_step {
 	NS2_INIT_STARTING,
