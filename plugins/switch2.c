@@ -375,9 +375,6 @@ static void send_cmd(struct switch2_data *data, uint8_t command, uint8_t subcomm
 	if (payload && payload_len > 0)
 		memcpy(buf + sizeof(struct switch2_cmd_header), payload, payload_len);
 
-	info("Switch2: OUT 0x%02X [Sub %02X] (Total %zu)", command, subcommand,
-			payload_len + sizeof(struct switch2_cmd_header));
-
 	if (data->handle_out && data->client)
 		bt_gatt_client_write_without_response(data->client, data->handle_out,
 				false, buf, payload_len + sizeof(struct switch2_cmd_header));
@@ -396,14 +393,7 @@ static gboolean uhid_read_handler(GIOChannel *source, GIOCondition condition, gp
 		return TRUE;
 
 	switch (ev.type) {
-	case UHID_START:
-	case UHID_OPEN:
-		// Kernel driver attached/opened
-		info("Kernel driver attached");
-		break;
-
 	case UHID_OUTPUT:
-		info("Switch2: UHID IN 0x%02x (Size = %d)", ev.u.output.data[1], ev.u.output.size);
 		if (ev.u.output.rtype == UHID_OUTPUT_REPORT) {
 			uint8_t report_id = ev.u.output.data[0];
 
@@ -470,15 +460,13 @@ static int create_uhid_device(struct switch2_data *data) {
 		close(data->uhid_fd);
 		data->uhid_fd = -1;
 		return err;
-    }
+	}
 
 	data->uhid_io = g_io_channel_unix_new(data->uhid_fd);
 	g_io_channel_set_encoding(data->uhid_io, NULL, NULL);
 	data->uhid_watch_id = g_io_add_watch(data->uhid_io,
 										G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL,
 										uhid_read_handler, data);
-
-	info("Switch2: Created uHID device");
 
 	return 0;
 }
@@ -528,7 +516,6 @@ static void save_ltk(struct switch2_data *data) {
 
 	g_free(content);
 	g_key_file_free(key_file);
-	info("Switch2: Persisted LTK for %s", addr);
 }
 
 static bool load_ltk(struct switch2_data *data) {
@@ -553,7 +540,6 @@ static bool load_ltk(struct switch2_data *data) {
 			data->LTK[i] = (uint8_t)byte;
 		}
 		success = true;
-		info("Switch2: Loaded existing LTK for %s", addr);
 	}
 
 	if (ltk_str) g_free(ltk_str);
@@ -686,8 +672,6 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 	struct switch2_cmd_header *hdr = (struct switch2_cmd_header *)value;
 	const uint8_t *payload = value + sizeof(struct switch2_cmd_header);
 
-	info("Switch2: IN 0x%02x (size: %d)", hdr->command, length);
-
 	switch (data->state) {
 	case NS2_INIT_CMD_07:
 		if (hdr->command == NS2_CMD_INIT_07) {
@@ -711,14 +695,12 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 	case NS2_INIT_BT_CHECK_LTK:
 		if (hdr->command == NS2_CMD_FLASH) {
 			if (memcmp(data->LTK, &payload[8], 16) == 0) {
-				info("Switch2: LTK Match! Skipping pairing.");
 				data->state = NS2_INIT_DONE;
 				play_vibration_sample(data);
 				set_report_rate(data);
 				enable_hid_reports(data);
 				create_uhid_device(data);
 			} else {
-				info("Switch2: LTK Mismatch or New Device. Starting pairing...");
 				data->state = NS2_INIT_BT_ADDR_EXCHANGE;
 				pairing_exchange_addr(data);
 			}
@@ -758,10 +740,7 @@ static void resp_notify_handler(uint16_t value_handle, const uint8_t *value, uin
 		}
 		break;
 	case NS2_INIT_DONE:
-		/* Forward command responses to uHID */
-		info("Switch2: Forwarding command response to uHID");
-		info("Switch2: UHID OUT 0x%02x (size: %d)", value[0], length);
-
+		/* BT init done, forward further command respnses to uHID */
 		write_uhid_padded(data, NS2_REPORT_CMD_TUNNEL, value, length);
 		break;
 	default:
